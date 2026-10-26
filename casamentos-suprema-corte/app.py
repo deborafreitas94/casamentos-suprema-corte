@@ -1,4 +1,4 @@
-import os, sqlite3, secrets
+import os, sqlite3, secrets, json, requests
 from datetime import date, datetime, timedelta
 from functools import wraps
 from io import BytesIO
@@ -17,6 +17,19 @@ app.secret_key = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('COOKIE_SECURE') == '1'
+DISCORD_CLIENT_ID = os.environ.get('DISCORD_CLIENT_ID', '').strip()
+DISCORD_CLIENT_SECRET = os.environ.get('DISCORD_CLIENT_SECRET', '').strip()
+DISCORD_GUILD_ID = os.environ.get('DISCORD_GUILD_ID', '').strip()
+DISCORD_REDIRECT_URI = os.environ.get('DISCORD_REDIRECT_URI', '').strip()
+# JSON: {"123456789012345678":"Ministro do Supremo","987654321098765432":"Juiz"}
+try:
+ DISCORD_ROLE_NAMES = json.loads(os.environ.get('DISCORD_ROLE_NAMES', '{}'))
+ if not isinstance(DISCORD_ROLE_NAMES, dict): DISCORD_ROLE_NAMES = {}
+except json.JSONDecodeError:
+ DISCORD_ROLE_NAMES = {}
+DISCORD_ALLOWED_ROLE_IDS = set(filter(None, (v.strip() for v in os.environ.get('DISCORD_ALLOWED_ROLE_IDS', '').split(','))))
+DISCORD_API = 'https://discord.com/api/v10'
+
 
 PACKAGES = {
  'ouro': {'name':'Ouro', 'description':'Cerimônia essencial com juiz de paz e certidão personalizada.', 'items':['Juiz de Paz para a cerimônia', 'Certidão de casamento personalizada']},
@@ -51,7 +64,7 @@ def verify_csrf():
 def admin_required(fn):
  @wraps(fn)
  def inner(*args, **kwargs):
-  if not session.get('admin'): return redirect(url_for('login'))
+  if not session.get('admin') and not session.get('discord_user'): return redirect(url_for('login'))
   return fn(*args, **kwargs)
  return inner
 
@@ -80,6 +93,60 @@ def submit():
   con.execute('''INSERT INTO requests(protocol,package,package_price,partner1,partner1_id,partner2,partner2_id,judge,judge_id,ceremony_date,ceremony_time,venue,invitation,music,notes,contact,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (protocol,pkg,price,*values,'Solicitado',datetime.now().isoformat(timespec='seconds')))
  return render_template('success.html', protocol=protocol)
 
+def discord_configured():
+ return all((DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_GUILD_ID, DISCORD_REDIRECT_URI, DISCORD_ALLOWED_ROLE_IDS))
+
+@app.route('/auth/discord')
+def discord_start():
+ if not discord_configured():
+  abort(503, 'Integração Discord ainda não configurada.')
+ state = secrets.token_urlsafe(32)
+ session['discord_oauth_state'] = state
+ from urllib.parse import urlencode
+ params = {'client_id': DISCORD_CLIENT_ID, 'redirect_uri': DISCORD_REDIRECT_URI,
+           'response_type': 'code', 'scope': 'identify guilds.members.read', 'state': state}
+ return redirect('https://discord.com/oauth2/authorize?' + urlencode(params))
+
+@app.route('/auth/discord/callback')
+def discord_callback():
+ state = session.pop('discord_oauth_state', None)
+ if not state or not secrets.compare_digest(state, request.args.get('state', '')):
+  abort(400, 'Estado OAuth inválido. Tente novamente.')
+ if request.args.get('error'):
+  flash('Autorização do Discord cancelada.', 'error'); return redirect(url_for('login'))
+ code = request.args.get('code', '')
+ if not code: abort(400, 'Código de autorização ausente.')
+ try:
+  token_resp = requests.post(DISCORD_API + '/oauth2/token', data={
+   'client_id': DISCORD_CLIENT_ID, 'client_secret': DISCORD_CLIENT_SECRET,
+   'grant_type': 'authorization_code', 'code': code,
+   'redirect_uri': DISCORD_REDIRECT_URI}, timeout=12)
+  token_resp.raise_for_status()
+  token = token_resp.json()['access_token']
+  headers = {'Authorization': 'Bearer ' + token}
+  user_resp = requests.get(DISCORD_API + '/users/@me', headers=headers, timeout=12)
+  member_resp = requests.get(DISCORD_API + '/users/@me/guilds/' + DISCORD_GUILD_ID + '/member', headers=headers, timeout=12)
+  if member_resp.status_code in (403, 404):
+   flash('Você precisa participar do Discord oficial para acessar.', 'error'); return redirect(url_for('login'))
+  user_resp.raise_for_status(); member_resp.raise_for_status()
+  user = user_resp.json(); member = member_resp.json()
+ except (requests.RequestException, KeyError, ValueError):
+  flash('Não foi possível validar sua conta no Discord. Tente novamente.', 'error'); return redirect(url_for('login'))
+ roles = set(map(str, member.get('roles', [])))
+ authorized = roles & DISCORD_ALLOWED_ROLE_IDS
+ if not authorized:
+  flash('Seu cargo no Discord não tem permissão para acessar este painel.', 'error'); return redirect(url_for('login'))
+ # Ordem de prioridade definida em DISCORD_ALLOWED_ROLE_IDS (primeiro cargo vence).
+ role_id = next((r for r in os.environ.get('DISCORD_ALLOWED_ROLE_IDS','').split(',') if r.strip() in authorized), '')
+ role_id = role_id.strip()
+ name = member.get('nick') or (member.get('user') or {}).get('global_name') or user.get('global_name') or user.get('username', 'Usuário')
+ avatar_hash = user.get('avatar')
+ avatar = ('https://cdn.discordapp.com/avatars/' + str(user['id']) + '/' + avatar_hash + '.png') if avatar_hash else None
+ session.clear()
+ session['discord_user'] = {'id': str(user['id']), 'name': str(name)[:100],
+                            'role_id': role_id, 'role': str(DISCORD_ROLE_NAMES.get(role_id, 'Cargo autorizado'))[:100], 'avatar': avatar}
+ return redirect(url_for('dashboard'))
+
 @app.route('/admin/setup', methods=['GET','POST'])
 def setup():
  with connect() as con: exists=con.execute('SELECT 1 FROM admin LIMIT 1').fetchone()
@@ -97,13 +164,13 @@ def setup():
 @app.route('/admin/login', methods=['GET','POST'])
 def login():
  with connect() as con:
-  if not con.execute('SELECT 1 FROM admin LIMIT 1').fetchone(): return redirect(url_for('setup'))
+  if not con.execute('SELECT 1 FROM admin LIMIT 1').fetchone() and not discord_configured(): return redirect(url_for('setup'))
  if request.method=='POST':
   with connect() as con: admin=con.execute('SELECT * FROM admin WHERE username=?',(request.form.get('username',''),)).fetchone()
   if admin and check_password_hash(admin['password_hash'],request.form.get('password','')):
    session.clear(); session['admin']=admin['id']; return redirect(url_for('dashboard'))
   flash('Credenciais inválidas.','error')
- return render_template('auth.html', mode='login')
+ return render_template('auth.html', mode='login', discord_enabled=discord_configured())
 
 @app.route('/admin/logout', methods=['POST'])
 @admin_required
@@ -114,7 +181,7 @@ def logout():
 @admin_required
 def dashboard():
  with connect() as con: rows=con.execute('SELECT * FROM requests ORDER BY id DESC').fetchall()
- return render_template('dashboard.html', rows=rows, packages=PACKAGES, statuses=STATUSES)
+ return render_template('dashboard.html', rows=rows, packages=PACKAGES, statuses=STATUSES, discord_user=session.get('discord_user'))
 
 @app.route('/admin/<int:request_id>/status', methods=['POST'])
 @admin_required
