@@ -215,6 +215,24 @@ def pdf(request_id):
  c.setFillColor(gold); c.setFont('Helvetica',9); c.drawCentredString(width/2,38,'Documento de solicitacao. Nao equivale a certidao de casamento.')
  c.save(); buf.seek(0)
  return send_file(buf,mimetype='application/pdf',as_attachment=True,download_name=f'{row["protocol"]}.pdf')
+@app.route('/diagnostico-discord')
+def diagnostico_discord():
+    nomes = [
+        'DISCORD_CLIENT_ID',
+        'DISCORD_CLIENT_SECRET',
+        'DISCORD_GUILD_ID',
+        'DISCORD_REDIRECT_URI',
+        'DISCORD_ALLOWED_ROLE_IDS'
+    ]
 
+    faltando = [
+        nome for nome in nomes
+        if not os.environ.get(nome, '').strip()
+    ]
+
+    return {
+        'discord_configurado': discord_configured(),
+        'quantidade_variaveis_ausentes': len(faltando)
+    }
 if __name__=='__main__':
  app.run(host='127.0.0.1',port=int(os.environ.get('PORT','5000')),debug=False)
